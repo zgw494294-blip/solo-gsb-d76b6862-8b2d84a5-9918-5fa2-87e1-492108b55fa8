@@ -596,6 +596,256 @@ resp, _, _ = r_post(ro_url(exp5, "a"), {"enabled": True})
 check("路由·active期间只读409响应含error字段", resp.status_code == 409 and "error" in resp.get_json())
 r_post(script_url(exp5, "/cancel"), {"script_id": sid_e5b, "step": 1})
 
+# ================= 两栏独立执行：在途请求不串行化另一栏 =================
+# 修复前手工操作 / 只读切换路由在「复查 + 执行」整段持有全局
+# script_lock：甲的读值（或任何操作）尚未完成时，乙的 BEGIN / 只读切换
+# 都在同一把锁外排队；修复后两栏只各取本栏 conn_lock，另一栏立即推进。
+# 用一次性闸门包住某栏长期连接的 execute，把该栏请求停在语句执行中点，
+# 从另一线程驱动**实际路由**，断言另一栏请求在闸门释放前已经完成。
+
+
+class _GatedConn:
+    """把真实 sqlite 连接的 execute 包一层一次性闸门的代理。
+
+    enter 在拿到本栏 conn_lock、进入 execute 前触发（armed 时），
+    gate 不打开则 execute 不返回——精确模拟「该栏请求在途未完成」。
+    代理只替换 execute，其余属性（in_transaction / create_function 等）
+    透传真实连接；__class__ 伪装成真实连接类，避免任何 isinstance 判断。
+    """
+
+    def __init__(self, real, enter, gate):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_enter", enter)
+        object.__setattr__(self, "_gate", gate)
+
+    @property
+    def __class__(self):
+        return type(object.__getattribute__(self, "_real"))
+
+    def execute(self, sql, *args, **kwargs):
+        real = object.__getattribute__(self, "_real")
+        enter = object.__getattribute__(self, "_enter")
+        gate = object.__getattribute__(self, "_gate")
+        enter(sql)
+        gate.wait()
+        return real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_real"), name, value)
+
+
+def install_gate(exp_id, side, predicate):
+    """把某栏连接替换成闸门代理，返回 (exp, gate, entered, restore)。
+
+    predicate(sql) 首次为真时，该次 execute 在进入真实语句前停在 gate 上
+    （一次性，后续语句不再拦截）。
+    """
+    exp = A.experiments[exp_id]
+    real = exp.conns[side]
+    gate = threading.Event()
+    entered = threading.Event()
+
+    def enter(sql):
+        if not entered.is_set() and predicate(sql):
+            entered.set()
+            gate.wait()
+
+    exp.conns[side] = _GatedConn(real, enter, gate)
+
+    def restore():
+        if not gate.is_set():
+            gate.set()
+        exp.conns[side] = real
+
+    return exp, gate, entered, restore
+
+
+def route_async(fn, *args):
+    box = {}
+
+    def runner():
+        try:
+            box["resp"] = fn(*args)
+        except Exception as exc:
+            box["exc"] = exc
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    return box, t
+
+
+CROSS_TIMEOUT = 3.0
+
+for x, y in (("a", "b"), ("b", "a")):
+    exp6 = create_exp()
+
+    # x 栏读值在途（execute 停在闸门处未返回）
+    exp_o, gate, entered, restore = install_gate(exp6, x, lambda sql: sql.lstrip().upper().startswith("SELECT"))
+    box_read, t_read = route_async(client.post, op_url(exp6, x), {"op": "read"})
+    assert entered.wait(CROSS_TIMEOUT), "前置：%s 栏读值应已进入闸门" % x
+    assert t_read.is_alive(), "前置：%s 栏读值应在途未完成" % x
+
+    # 另一栏 BEGIN 与只读切换必须在 x 释放前完成——修复前它们排在全局
+    # script_lock 外，会一直等到 x 的读值返回
+    box_begin, t_begin = route_async(client.post, op_url(exp6, y), {"op": "begin"})
+    t_begin.join(CROSS_TIMEOUT)
+    check("路由·两栏独立：%s读值在途时%s的BEGIN先完成(200)" % (x, y),
+          not t_begin.is_alive() and "exc" not in box_begin
+          and box_begin["resp"].status_code == 200
+          and box_begin["resp"].get_json()["state"]["in_transaction"] is True)
+
+    box_ro, t_ro = route_async(client.post, ro_url(exp6, y), {"enabled": True})
+    t_ro.join(CROSS_TIMEOUT)
+    check("路由·两栏独立：%s读值在途时%s的只读切换先完成(200)" % (x, y),
+          not t_ro.is_alive() and "exc" not in box_ro
+          and box_ro["resp"].status_code == 200
+          and box_ro["resp"].get_json()["state"]["readonly"] is True)
+
+    # 同栏请求仍串行：x 的第二个操作（重复 BEGIN 拒绝）必须等在途读值收尾
+    box_same, t_same = route_async(client.post, op_url(exp6, x), {"op": "begin"})
+    t_same.join(0.5)
+    check("路由·同栏串行：%s在途时同栏第二个请求等待" % x, t_same.is_alive())
+
+    # 在途期间状态接口可读内存（不被两栏阻塞）：y 的 BEGIN / 只读已生效
+    st = client.get("/api/experiments/%s/status" % exp6).get_json()
+    check("路由·两栏独立：在途期间%s已BEGIN、%s尚未执行第二请求" % (y, x),
+          st[y]["in_transaction"] is True and st[y]["readonly"] is True
+          and st[x]["last_read"] is None)
+
+    # 释放 x 的读值：读值完成；随后同栏第二个请求才得到「事务外/重复」语义
+    gate.set()
+    t_read.join(CROSS_TIMEOUT)
+    t_same.join(CROSS_TIMEOUT)
+    check("路由·两栏独立：%s在途读值释放后成功返回" % x,
+          "exc" not in box_read and box_read["resp"].get_json()["ok"] is True
+          and box_read["resp"].get_json()["state"]["last_read"] == 100)
+    # read 在事务外执行（x 未 BEGIN），随后 begin 正常开启
+    check("路由·同栏串行：%s第二请求在第一请求后才执行（BEGIN成功）" % x,
+          "exc" not in box_same and box_same["resp"].status_code == 200
+          and box_same["resp"].get_json()["ok"] is True
+          and box_same["resp"].get_json()["state"]["in_transaction"] is True)
+    restore()
+
+    # 两栏各自收尾（y 回滚并关只读；x 回滚）
+    client.post(ro_url(exp6, y), {"enabled": False})
+    client.post(op_url(exp6, y), {"op": "rollback"})
+    client.post(op_url(exp6, x), {"op": "rollback"})
+
+    # 删除等待已准入请求收尾：曾在途的请求全部完成，删除立即成功
+    resp, exc, stuck = r_delete("/api/experiments/%s" % exp6)
+    check("路由·两栏独立：交错后%s实验删除及时完成" % x,
+          not stuck and exc is None and resp.status_code == 200)
+
+# ---- 装载与在途手工请求交错：装载等待两栏 conn_lock，另一栏不被串行 ----
+exp7 = create_exp()
+# 甲 BEGIN 在途（闸门停在 BEGIN DEFERRED 语句中点）
+exp_o, gate, entered, restore = install_gate(exp7, "a", lambda sql: "BEGIN" in sql.upper())
+box_begin, t_begin = route_async(client.post, op_url(exp7, "a"), {"op": "begin"})
+assert entered.wait(CROSS_TIMEOUT), "前置：甲 BEGIN 应已进入闸门"
+
+# 甲 BEGIN 未完成时装载：装载要同时取两栏 conn_lock，卡在甲锁上；
+# 但乙的合法手工请求不依赖任何全局锁，必须照常先完成
+box_load, t_load = route_async(client.post, script_url(exp7),
+                               [{"side": "b", "op": "begin"},
+                                {"side": "b", "op": "commit"}])
+t_load.join(0.5)
+check("路由·装载交错：甲BEGIN在途时装载等待", t_load.is_alive())
+
+resp, exc, stuck = r_post(op_url(exp7, "b"), {"op": "read"})
+check("路由·装载交错：装载等待期间乙的读值照常完成",
+      not stuck and exc is None and resp.status_code == 200
+      and resp.get_json()["ok"] is True and resp.get_json()["state"]["last_read"] == 100)
+box_ro, t_ro = route_async(client.post, ro_url(exp7, "b"), {"enabled": True})
+t_ro.join(CROSS_TIMEOUT)
+check("路由·装载交错：装载等待期间乙的只读切换照常完成",
+      not t_ro.is_alive() and box_ro["resp"].status_code == 200
+      and box_ro["resp"].get_json()["state"]["readonly"] is True)
+
+# 甲 BEGIN 落库 → 装载拿到两栏锁、复查到甲有事务 → 409（绝不与甲事务并存）
+gate.set()
+t_begin.join(CROSS_TIMEOUT)
+t_load.join(CROSS_TIMEOUT)
+check("路由·装载交错：手工BEGIN先成功则装载409",
+      not t_begin.is_alive() and box_begin["resp"].get_json()["ok"] is True
+      and not t_load.is_alive() and box_load["resp"].status_code == 409)
+# 装载被拒不产生有效脚本：甲 / 乙手工仍可用（名额与脚本状态均未被占）
+resp, _, _ = r_get(script_url(exp7))
+check("路由·装载交错：被拒装载不留下active脚本",
+      resp.get_json()["script"] is None)
+resp, _, _ = r_post(op_url(exp7, "b"), {"op": "begin"})
+check("路由·装载交错：装载409后乙仍可BEGIN",
+      resp.status_code == 200 and resp.get_json()["ok"] is True)
+# 收尾
+client.post(op_url(exp7, "b"), {"op": "rollback"})
+client.post(ro_url(exp7, "b"), {"enabled": False})
+client.post(op_url(exp7, "a"), {"op": "rollback"})
+restore()
+resp, exc, stuck = r_delete("/api/experiments/%s" % exp7)
+check("路由·装载交错：删除及时完成（被拒装载已归还名额）",
+      not stuck and resp.status_code == 200)
+
+# ---- 确定性「装载先成功」：parse_int 闸门把手工 add 请求停在取 conn_lock 之前 ----
+# 随机交错（前面 20 轮）已覆盖两种先后；这里额外制造确定性时序：
+# 手工 add 请求已完成准入门控、但在 parse_int 处停住（尚未取本栏 conn_lock），
+# 让装载先持两栏锁发布 active；随后放行 parse_int，手工请求取到锁复查
+# active 必须 409 且不执行——不能出现「装载成功后手工 BEGIN 才开启事务」，
+# 这里同理不允许「装载成功后手工加法再落地」。
+exp8 = create_exp()
+orig_parse_int = A.parse_int
+parse_ev = threading.Event()
+release_parse = threading.Event()
+
+
+def gated_parse_int(raw):
+    if not parse_ev.is_set() and isinstance(raw, str) and raw == "11":
+        parse_ev.set()
+        release_parse.wait(CROSS_TIMEOUT)
+    return orig_parse_int(raw)
+
+
+A.parse_int = gated_parse_int
+try:
+    box_add, t_add = route_async(client.post, op_url(exp8, "a"),
+                                 {"op": "add", "value": "11"})
+    assert parse_ev.wait(CROSS_TIMEOUT), "前置：手工 add 应停在 parse_int"
+    # 此刻手工请求尚未取甲 conn_lock；装载成功（两栏均无事务）
+    resp, exc, stuck = r_post(script_url(exp8),
+                              [{"side": "a", "op": "read"},
+                               {"side": "b", "op": "read"}])
+    check("路由·装载先成功：200", not stuck and resp.status_code == 200)
+    sid_e8 = resp.get_json()["script"]["id"]
+    # 放行手工 add：复查 active → 409，不执行（值仍为 100、无事务）
+    release_parse.set()
+    t_add.join(CROSS_TIMEOUT)
+    check("路由·装载先成功：在途手工add 409且不执行",
+          not t_add.is_alive() and box_add["resp"].status_code == 409)
+    resp, _, _ = r_get("/api/experiments/%s/status" % exp8)
+    check("路由·装载先成功：409未开启事务、未改值",
+          resp.get_json()["a"]["in_transaction"] is False)
+    resp, _, _ = r_get("/api/experiments/%s/committed" % exp8)
+    check("路由·装载先成功：已提交值仍为100", resp.get_json()["committed"] == 100)
+
+    # 失败 / 拒绝请求归还准入名额：推进、查询、删除都不被在途或被拒请求阻塞
+    resp, exc, stuck = r_post(script_url(exp8, "/advance"),
+                              {"script_id": sid_e8, "step": 1})
+    check("路由·装载先成功：被拒手工请求不阻塞推进",
+          not stuck and resp.status_code == 200 and resp.get_json()["ok"] is True)
+    r_post(script_url(exp8, "/cancel"), {"script_id": sid_e8, "step": 2})
+    # 取消后无未提交事务（read 不开事务），手工恢复
+    resp, _, _ = r_post(op_url(exp8, "a"), {"op": "begin"})
+    check("路由·装载先成功：取消后手工BEGIN恢复200",
+          resp.status_code == 200 and resp.get_json()["ok"] is True)
+    client.post(op_url(exp8, "a"), {"op": "rollback"})
+    resp, exc, stuck = r_delete("/api/experiments/%s" % exp8)
+    check("路由·装载先成功：删除及时完成（名额已归还）",
+          not stuck and resp.status_code == 200)
+finally:
+    release_parse.set()
+    A.parse_int = orig_parse_int
+
 # 收尾：删除其余实验，确认没有请求占住准入名额
 clean_ok = True
 for e in (exp1, exp3, exp4, exp5):

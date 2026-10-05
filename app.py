@@ -52,8 +52,10 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 （begin/read/add/commit/rollback），add 另含 value，沿用与手工加法
 完全相同的整数校验（parse_int、±2⁶² 上限、大整数十进制字符串）。
 整份校验、非法整份拒绝（400），任何已存在脚本都不受影响。仅当两栏
-均无事务且当前没有有效（active）脚本时才能装载——装载在 script_lock
-内同时持两栏 conn_lock 复查 in_transaction，与手工 BEGIN 严格互斥。
+均无事务且当前没有有效（active）脚本时才能装载——装载先取 script_lock
+复查 active，再同时持两栏 conn_lock 复查 in_transaction 后才发布脚本，
+与手工 BEGIN 严格互斥（锁序 script_lock → conn_lock(a) → conn_lock(b)；
+手工请求只取本栏 conn_lock，两栏因此互不串行）。
 脚本只保存在内存，生成独立脚本 ID；查询（GET …/script 及 /status 的
 script 字段）只读内存，返回脚本 ID、从 1 开始的当前步号、全部步骤与
 逐次执行记录，绝不在两栏连接上额外读值。
@@ -207,13 +209,24 @@ class Experiment:
         self.timeline_lock = threading.Lock()
         self.timeline = []
         # 脚本逐步执行状态：只保存在内存，无需跨重启保留。
-        # script_lock 串行化「装载 / 推进 / 跳过 / 取消」与手工操作的
-        # active 互斥复查；同实验的脚本动作先在该锁上核对脚本 ID 与步号，
-        # 再真实执行，过期请求一律 409，不会触碰到新脚本。
-        # 手工操作 / 只读切换路由在「复查 + 执行」整段持有这把锁，
-        # 锁内读标志只能用 _script_active_locked()——threading.Lock
-        # 不可重入，锁内再次获取会让请求永久卡住，并占住准入名额，
-        # 使随后的脚本查询、推进与删除一并阻塞。
+        # script_lock 串行化「装载 / 推进 / 跳过 / 取消 / 查询」对脚本对象的
+        # 访问；同实验的脚本动作先在该锁上核对脚本 ID 与步号，再真实执行，
+        # 过期请求一律 409，不会触碰到新脚本。
+        #
+        # 手工操作 / 只读切换**不持有 script_lock**：它们只取本栏 conn_lock，
+        # 在同一把锁内复查 active 标志并完成真实执行。两栏 conn_lock 互相
+        # 独立，因此甲的在途请求（如读值未完成）不会串行化乙的 BEGIN /
+        # 只读切换，反之亦然；同栏请求仍由本栏 conn_lock 串行。与装载的
+        # 互斥完全由 conn_lock 提供：装载在 script_lock 内同时取两栏
+        # conn_lock 复查 in_transaction 并发布新脚本（锁序
+        # script_lock → conn_lock(a) → conn_lock(b)），手工路由只取
+        # conn_lock（不反向请求 script_lock），两组锁序不构成环。
+        # 「手工先取到本栏锁并 BEGIN」⇒ 装载随后才拿到两栏锁、复查到事务，
+        # 返回 409；「装载先持两栏锁发布 active」⇒ 手工随后拿到本栏锁时
+        # 复查到 active，返回 409 且不执行。锁内读标志用不取
+        # script_lock 的 script_active()——active 只可能由装载发布（必持
+        # 两栏 conn_lock），conn_lock 已建立可见性；推进 / 取消只会把 active
+        # 置为结束态，迟读到 active 至多是一次 409，语义无害。
         self.script_lock = threading.Lock()
         self.script = None  # None 或 {id, steps, cursor, records, status}
 
@@ -346,9 +359,13 @@ class Experiment:
         """装载新脚本。调用方已完成整份校验。
 
         仅当两栏均无事务且没有 active 脚本时才允许；在 script_lock 内
-        同时持两栏 conn_lock 复查 in_transaction，与手工 BEGIN 严格互斥，
-        不会出现「检查时无事务、装载时已 BEGIN」的窗口。成功后旧脚本的
-        查看记录被新脚本替换，旧脚本的在途动作因 ID 不符一律 409。
+        同时持两栏 conn_lock 复查 in_transaction 后才发布新脚本，与手工
+        BEGIN 严格互斥，不会出现「检查时无事务、装载时已 BEGIN」的窗口。
+        成功后旧脚本的查看记录被新脚本替换，旧脚本的在途动作因 ID 不符
+        一律 409。两栏 conn_lock 在持锁期间也阻止两栏手工请求执行：手工
+        请求要么在装载持锁前已 BEGIN（这里复查到事务，409），要么在装载
+        释放后才取到锁（复查到 active，409 不执行）；手工请求绝不会在
+        装载已发布成功后才开启事务。
         """
         with self.script_lock:
             if self.script is not None and self.script["status"] == "active":
@@ -458,8 +475,12 @@ class Experiment:
             if stale is not None:
                 return self.script_view(script), False, {"error": stale}
             step = script["steps"][script["cursor"]]
-            # run_op 只取该栏自己的 conn_lock 与 timeline_lock，
-            # 与已持有的 script_lock 不构成环；真实在该栏原长期连接执行。
+            # run_op 取该栏自己的 conn_lock 再转入 run_op_locked：
+            # 锁序 script_lock → conn_lock 与 load_script 完全一致，
+            # 手工路由只取 conn_lock（从不反向取 script_lock），不构成环。
+            # 这样脚本步执行期间同栏手工请求仍在 conn_lock 上正确串行
+            # （active 期间它们会先被 409 拒绝，但锁序约束不依赖这一点），
+            # 两栏之间依旧互不阻塞。
             result = run_op(self, step["side"], step["op"], step.get("value"))
             script["records"].append(
                 self._script_record(step_no, step, result)
@@ -499,15 +520,14 @@ class Experiment:
             return self.script_view(script), True, None
 
     def script_active(self):
-        # 手工事务操作与只读切换的准入检查（script_lock 内读标志）
-        with self.script_lock:
-            return self._script_active_locked()
-
-    def _script_active_locked(self):
-        # 调用方必须已持有 script_lock。手工操作 / 只读切换路由在
-        # 「复查 + 执行」整段持有同一把锁（见路由注释），这里绝不能再
-        # 获取：threading.Lock 不可重入，重复获取会让请求永久卡住，
-        # 占住准入名额并阻塞随后的脚本查询、推进与删除。
+        # 手工事务操作与只读切换的准入检查。手工路由不持有 script_lock，
+        # 因此这里不能取 script_lock 再用带 _locked 后缀的读法：
+        # 一方面 threading.Lock 不可重入，另一方面手工线程与脚本动作线程
+        # 若互相争用 script_lock 会把两栏重新串回同一把全局锁上。
+        # active 只可能由 load_script 发布（发布时必持两栏 conn_lock），
+        # 调用方已持有本栏 conn_lock，conn_lock 的获取/释放已建立
+        # happens-before；推进 / 取消只会把 active 改成结束态，迟读至多
+        # 导致一次 409（脚本刚好结束），调用方重试即可，语义无害。
         return self.script is not None and self.script["status"] == "active"
 
     def checkpoint_state(self):
@@ -607,7 +627,23 @@ class Experiment:
 
 
 def run_op(exp, side, op, value):
-    """在指定栏的长期连接上真实执行一个操作，返回 {ok, error, state}。"""
+    """取本栏 conn_lock 后在该栏长期连接上真实执行一个操作。
+
+    两栏锁互相独立：甲的在途操作（如读值尚未完成）不会阻塞乙，反之亦然；
+    同栏请求在本把锁上严格串行。调用方若已持有本栏 conn_lock（如脚本
+    推进持 script_lock 后转入执行），应直接调用 run_op_locked。
+    """
+    with exp.conn_locks[side]:
+        return run_op_locked(exp, side, op, value)
+
+
+def run_op_locked(exp, side, op, value):
+    """在指定栏的长期连接上真实执行一个操作，返回 {ok, error, state}。
+
+    调用方必须已持有 exp.conn_locks[side]。active 复查由手工路由在进入
+    本函数前、同一把 conn_lock 内完成——保证「复查 + 执行」与装载持两栏
+    conn_lock 发布脚本的临界区严格互斥，复查不通过即 409 且绝不执行。
+    """
     panel = exp.panels[side]
     conn = exp.conns[side]
     label = "加上 %s" % value if op == "add" else OP_LABELS.get(op, op)
@@ -620,143 +656,152 @@ def run_op(exp, side, op, value):
             "state": exp.panel_state(side),
         }
 
-    with exp.conn_locks[side]:
-        try:
-            if op == "begin":
-                if conn.in_transaction:
-                    return reject("事务已开启，不能重复 BEGIN")
-                conn.execute("BEGIN DEFERRED")
-                # 新事务从空的待记录增量开始（正常已为空，防御性重置）
-                panel.tx_adds = []
-                panel.tx_has_snapshot = False
-                panel.add_log("BEGIN DEFERRED → 成功，事务已开启")
-            elif op == "read":
-                row = conn.execute("SELECT val FROM kv WHERE id = 1").fetchone()
-                panel.last_read = row[0]
-                panel.tx_has_snapshot = conn.in_transaction
-                scope = "事务内" if conn.in_transaction else "事务外（自动提交）"
-                panel.add_log("读值（%s）→ %s" % (scope, row[0]))
-            elif op == "add":
-                if not conn.in_transaction:
-                    return reject("禁止事务外修改：请先 BEGIN DEFERRED")
-                overflow_message = OVERFLOW_MESSAGE
-                if panel.tx_has_snapshot:
-                    # 本事务已有读快照（显式读值或此前写过）：
-                    # 直接在事务内读当前值做精确边界检查，行为与单事务内
-                    # 可见性完全一致。快照过时导致的写冲突仍由 SQLite
-                    # 如实报 SQLITE_BUSY_SNAPSHOT，不做任何自动处理。
-                    current = conn.execute(
-                        "SELECT val FROM kv WHERE id = 1"
-                    ).fetchone()[0]
-                    if not INT64_MIN <= current + value <= INT64_MAX:
-                        return reject(overflow_message)
-                else:
-                    # 关键路径：事务尚无读快照（BEGIN 后第一次操作就是写）。
-                    # 绝不能先在本连接 SELECT —— 那会建立读快照：若对方正
-                    # 持有写锁，本次 UPDATE 拿到 SQLITE_BUSY 后快照已留下，
-                    # 对方提交后重试就会被误报为 SQLITE_BUSY_SNAPSHOT。
-                    # 这里用 observer 看到的已提交值做无锁预判：仅当
-                    # 「已提交值 + 增量」本身就越界时直接拒绝，从而保持
-                    # 溢出拒绝不获取写锁、不影响另一栏的原有行为。
-                    committed = exp.committed_value()
-                    if not INT64_MIN <= committed + value <= INT64_MAX:
-                        return reject(overflow_message)
-                # 最终精确判定放在 UPDATE 内的 checked_add：
-                # 无快照预判与真实写入之间若对方恰好提交了别的值，
-                # 仍以语句内计算为准，保证永远不会静默写成 REAL。
-                # 纯写语句在写锁被占时返回 SQLITE_BUSY 且不建立读快照，
-                # 因此对方提交/回滚释放写锁后可在同一事务直接重试成功。
-                exp.overflow_flags[side][0] = False
-                exp.add_base_slots[side][0] = None
-                conn.execute(
-                    "UPDATE kv SET val = checked_add(val, ?) WHERE id = 1",
-                    (value,),
-                )
-                # checked_add 已在 UPDATE 语句内捕获本次加法基于的行值
-                # （事务自身视图），记入本事务待提交的增量列表，供提交
-                # 时间线使用；不执行任何额外读取，不影响快照与加锁顺序。
-                base = exp.add_base_slots[side][0]
-                if base is not None:
-                    panel.tx_adds.append((base, value))
-                panel.tx_has_snapshot = True
-                panel.add_log("加上 %s → 成功（尚未提交）" % value)
-            elif op == "commit":
-                if not conn.in_transaction:
-                    return reject("当前没有开启的事务")
-                if panel.tx_adds:
-                    # 本事务有成功加法：COMMIT 与记录追加在同一临界区完成，
-                    # 时间线编号顺序与实际提交顺序严格一致；COMMIT 失败时
-                    # 异常直接抛出，不记录、tx_adds 保留，事务仍开启，
-                    # 之后重试 COMMIT 成功只记录一次。
-                    with exp.timeline_lock:
-                        conn.execute("COMMIT")
-                        exp.append_timeline(side, panel.tx_adds)
-                    panel.tx_adds = []
-                else:
-                    # 纯读事务（或只有失败加法）：照常提交，不产生记录
-                    conn.execute("COMMIT")
-                panel.tx_has_snapshot = False
-                panel.add_log("COMMIT → 成功，事务已提交")
-            elif op == "rollback":
-                if not conn.in_transaction:
-                    return reject("当前没有开启的事务")
-                conn.execute("ROLLBACK")
-                # 回滚不产生时间线记录，丢弃本事务待记录的增量
-                panel.tx_adds = []
-                panel.tx_has_snapshot = False
-                panel.add_log("ROLLBACK → 成功，事务已回滚")
-            else:
-                return reject("未知操作：%s" % op)
-        except sqlite3.Error as exc:
-            # 个别错误会让 SQLite 隐式回滚整个事务：若事务已不存在，
-            # 丢弃待记录的增量，已被撤销的写入绝不进入时间线
+    try:
+        if op == "begin":
+            if conn.in_transaction:
+                return reject("事务已开启，不能重复 BEGIN")
+            conn.execute("BEGIN DEFERRED")
+            # 新事务从空的待记录增量开始（正常已为空，防御性重置）
+            panel.tx_adds = []
+            panel.tx_has_snapshot = False
+            panel.add_log("BEGIN DEFERRED → 成功，事务已开启")
+        elif op == "read":
+            row = conn.execute("SELECT val FROM kv WHERE id = 1").fetchone()
+            panel.last_read = row[0]
+            panel.tx_has_snapshot = conn.in_transaction
+            scope = "事务内" if conn.in_transaction else "事务外（自动提交）"
+            panel.add_log("读值（%s）→ %s" % (scope, row[0]))
+        elif op == "add":
             if not conn.in_transaction:
+                return reject("禁止事务外修改：请先 BEGIN DEFERRED")
+            overflow_message = OVERFLOW_MESSAGE
+            if panel.tx_has_snapshot:
+                # 本事务已有读快照（显式读值或此前写过）：
+                # 直接在事务内读当前值做精确边界检查，行为与单事务内
+                # 可见性完全一致。快照过时导致的写冲突仍由 SQLite
+                # 如实报 SQLITE_BUSY_SNAPSHOT，不做任何自动处理。
+                current = conn.execute(
+                    "SELECT val FROM kv WHERE id = 1"
+                ).fetchone()[0]
+                if not INT64_MIN <= current + value <= INT64_MAX:
+                    return reject(overflow_message)
+            else:
+                # 关键路径：事务尚无读快照（BEGIN 后第一次操作就是写）。
+                # 绝不能先在本连接 SELECT —— 那会建立读快照：若对方正
+                # 持有写锁，本次 UPDATE 拿到 SQLITE_BUSY 后快照已留下，
+                # 对方提交后重试就会被误报为 SQLITE_BUSY_SNAPSHOT。
+                # 这里用 observer 看到的已提交值做无锁预判：仅当
+                # 「已提交值 + 增量」本身就越界时直接拒绝，从而保持
+                # 溢出拒绝不获取写锁、不影响另一栏的原有行为。
+                committed = exp.committed_value()
+                if not INT64_MIN <= committed + value <= INT64_MAX:
+                    return reject(overflow_message)
+            # 最终精确判定放在 UPDATE 内的 checked_add：
+            # 无快照预判与真实写入之间若对方恰好提交了别的值，
+            # 仍以语句内计算为准，保证永远不会静默写成 REAL。
+            # 纯写语句在写锁被占时返回 SQLITE_BUSY 且不建立读快照，
+            # 因此对方提交/回滚释放写锁后可在同一事务直接重试成功。
+            exp.overflow_flags[side][0] = False
+            exp.add_base_slots[side][0] = None
+            conn.execute(
+                "UPDATE kv SET val = checked_add(val, ?) WHERE id = 1",
+                (value,),
+            )
+            # checked_add 已在 UPDATE 语句内捕获本次加法基于的行值
+            # （事务自身视图），记入本事务待提交的增量列表，供提交
+            # 时间线使用；不执行任何额外读取，不影响快照与加锁顺序。
+            base = exp.add_base_slots[side][0]
+            if base is not None:
+                panel.tx_adds.append((base, value))
+            panel.tx_has_snapshot = True
+            panel.add_log("加上 %s → 成功（尚未提交）" % value)
+        elif op == "commit":
+            if not conn.in_transaction:
+                return reject("当前没有开启的事务")
+            if panel.tx_adds:
+                # 本事务有成功加法：COMMIT 与记录追加在同一临界区完成，
+                # 时间线编号顺序与实际提交顺序严格一致；COMMIT 失败时
+                # 异常直接抛出，不记录、tx_adds 保留，事务仍开启，
+                # 之后重试 COMMIT 成功只记录一次。
+                with exp.timeline_lock:
+                    conn.execute("COMMIT")
+                    exp.append_timeline(side, panel.tx_adds)
                 panel.tx_adds = []
-            # checked_add 置位溢出标志时，这不是锁冲突而是越界拒绝：
-            # 语句已终止、行未修改、事务保持开启，沿用既有拒绝响应。
-            if exp.overflow_flags[side][0]:
-                exp.overflow_flags[side][0] = False
-                return reject(overflow_message)
-            # 写锁冲突等 SQLite 错误：如实上报错误名与错误码，
-            # 不做任何自动回滚，失败的事务保持开启。
-            name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
-            code = getattr(exc, "sqlite_errorcode", None)
-            panel.add_log("%s → 失败 [%s (%s)] %s" % (label, name, code, exc))
-            return {
-                "ok": False,
-                "error": {"name": name, "code": code, "message": str(exc)},
-                "state": exp.panel_state(side),
-            }
+            else:
+                # 纯读事务（或只有失败加法）：照常提交，不产生记录
+                conn.execute("COMMIT")
+            panel.tx_has_snapshot = False
+            panel.add_log("COMMIT → 成功，事务已提交")
+        elif op == "rollback":
+            if not conn.in_transaction:
+                return reject("当前没有开启的事务")
+            conn.execute("ROLLBACK")
+            # 回滚不产生时间线记录，丢弃本事务待记录的增量
+            panel.tx_adds = []
+            panel.tx_has_snapshot = False
+            panel.add_log("ROLLBACK → 成功，事务已回滚")
+        else:
+            return reject("未知操作：%s" % op)
+    except sqlite3.Error as exc:
+        # 个别错误会让 SQLite 隐式回滚整个事务：若事务已不存在，
+        # 丢弃待记录的增量，已被撤销的写入绝不进入时间线
+        if not conn.in_transaction:
+            panel.tx_adds = []
+        # checked_add 置位溢出标志时，这不是锁冲突而是越界拒绝：
+        # 语句已终止、行未修改、事务保持开启，沿用既有拒绝响应。
+        if exp.overflow_flags[side][0]:
+            exp.overflow_flags[side][0] = False
+            return reject(overflow_message)
+        # 写锁冲突等 SQLite 错误：如实上报错误名与错误码，
+        # 不做任何自动回滚，失败的事务保持开启。
+        name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+        code = getattr(exc, "sqlite_errorcode", None)
+        panel.add_log("%s → 失败 [%s (%s)] %s" % (label, name, code, exc))
+        return {
+            "ok": False,
+            "error": {"name": name, "code": code, "message": str(exc)},
+            "state": exp.panel_state(side),
+        }
     return {"ok": True, "error": None, "state": exp.panel_state(side)}
 
 
 def run_set_readonly(exp, side, enabled):
+    """取本栏 conn_lock 后切换 PRAGMA query_only（锁规则同 run_op）。
+
+    两栏开关互相独立：甲在途的切换 / 操作不阻塞乙，反之亦然；同栏的
+    切换与其它操作仍由本栏 conn_lock 串行。
+    """
+    with exp.conn_locks[side]:
+        return run_set_readonly_locked(exp, side, enabled)
+
+
+def run_set_readonly_locked(exp, side, enabled):
     """在该栏**原长期连接**上真实切换 PRAGMA query_only。
 
-    不更换连接、不 COMMIT / ROLLBACK 当前事务，也不执行任何读取
-    （不会为 DEFERRED 事务建立读快照）；开关状态只保存在 PanelState。
-    开启后 SQLite 对写语句返回 SQLITE_READONLY(8)，此前写入与未提交
-    事务都原样保留；COMMIT / ROLLBACK 不重置开关。
+    调用方必须已持有 exp.conn_locks[side]。不更换连接、不 COMMIT /
+    ROLLBACK 当前事务，也不执行任何读取（不会为 DEFERRED 事务建立读
+    快照）；开关状态只保存在 PanelState。开启后 SQLite 对写语句返回
+    SQLITE_READONLY(8)，此前写入与未提交事务都原样保留；
+    COMMIT / ROLLBACK 不重置开关。
     """
     panel = exp.panels[side]
     conn = exp.conns[side]
     label = "只读模式：开启" if enabled else "只读模式：关闭"
-    with exp.conn_locks[side]:
-        try:
-            conn.execute("PRAGMA query_only=%d" % (1 if enabled else 0))
-        except sqlite3.Error as exc:
-            name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
-            code = getattr(exc, "sqlite_errorcode", None)
-            panel.add_log("%s → 失败 [%s (%s)] %s" % (label, name, code, exc))
-            return {
-                "ok": False,
-                "error": {"name": name, "code": code, "message": str(exc)},
-                "state": exp.panel_state(side),
-            }
-        panel.readonly = enabled
-        panel.add_log(
-            "%s → 成功（原连接、当前事务不变；提交 / 回滚不重置本开关）" % label
-        )
+    try:
+        conn.execute("PRAGMA query_only=%d" % (1 if enabled else 0))
+    except sqlite3.Error as exc:
+        name = getattr(exc, "sqlite_errorname", None) or "SQLITE_ERROR"
+        code = getattr(exc, "sqlite_errorcode", None)
+        panel.add_log("%s → 失败 [%s (%s)] %s" % (label, name, code, exc))
+        return {
+            "ok": False,
+            "error": {"name": name, "code": code, "message": str(exc)},
+            "state": exp.panel_state(side),
+        }
+    panel.readonly = enabled
+    panel.add_log(
+        "%s → 成功（原连接、当前事务不变；提交 / 回滚不重置本开关）" % label
+    )
     return {"ok": True, "error": None, "state": exp.panel_state(side)}
 
 
@@ -1079,12 +1124,15 @@ def experiment_op(exp_id, side):
         if op not in VALID_OPS:
             return jsonify({"error": "unknown op"}), 400
         # 脚本有效期间拒绝手工事务操作（查询 / 检查点 / 删除不受影响）。
-        # 注意必须在**整段执行**持有 script_lock：仅在 run_op 之前检查会留下
-        # TOCTOU 窗口——手工 BEGIN 实际执行前，另一线程可能已装载脚本成功
-        # （装载在同一把锁内复查两栏无事务），从而破坏「有事务不能装载」
-        # 不变量。锁序 script_lock → conn_lock（run_op 内部）与 load_script
-        # 完全一致，不构成死锁环。锁内读标志只能用 _script_active_locked()：
-        # script_lock 不可重入，重复获取会让请求永久卡住并占住准入名额。
+        # active 复查与真实执行必须在**同一把本栏 conn_lock** 内完成：
+        # 装载在 script_lock 内同时持两栏 conn_lock 复查事务并发布脚本，
+        # 手工先取到锁并 BEGIN ⇒ 装载复查到事务返回 409；装载先发布 ⇒
+        # 手工取到锁后复查到 active 返回 409 且绝不执行，不存在「装载
+        # 成功后手工 BEGIN 才开启事务」的窗口。这里**不能**取全局
+        # script_lock：两栏手工请求会被重新串行化（甲在途读值未完成时，
+        # 乙的 BEGIN / 只读切换也必须等待），而两栏 conn_lock 本就互相
+        # 独立。锁序只有 conn_lock（装载为 script_lock → 两栏
+        # conn_lock），不构成环。请求结束（含 409）在 finally 归还名额。
         value = None
         if op == "add":
             value = parse_int(data.get("value"))
@@ -1092,13 +1140,13 @@ def experiment_op(exp_id, side):
                 return jsonify({"error": "value must be an integer"}), 400
             if abs(value) > MAX_ADD_ABS:
                 return jsonify({"error": "value too large"}), 400
-        with exp.script_lock:
-            if exp._script_active_locked():
+        with exp.conn_locks[side]:
+            if exp.script_active():
                 return (
                     jsonify({"error": "manual operations are locked while a script is active"}),
                     409,
                 )
-            return jsonify(run_op(exp, side, op, value))
+            return jsonify(run_op_locked(exp, side, op, value))
     finally:
         exp.finish_call()
 
@@ -1117,15 +1165,16 @@ def experiment_set_readonly(exp_id, side):
         if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
             return jsonify({"error": "enabled must be a boolean"}), 400
         # 脚本有效期间只读切换同样锁定（脚本必须沿两栏既定连接语义执行）。
-        # 与手工操作一样在整段持 script_lock，避免「检查后、执行前恰好装载」；
-        # 锁内同样只能用不重复取锁的 _script_active_locked() 读标志。
-        with exp.script_lock:
-            if exp._script_active_locked():
+        # 与手工操作一样：复查与执行都在本栏 conn_lock 内，避免「检查后、
+        # 执行前恰好装载」；不取全局 script_lock，两栏切换 / 操作因此互不
+        # 串行。
+        with exp.conn_locks[side]:
+            if exp.script_active():
                 return (
                     jsonify({"error": "readonly switch is locked while a script is active"}),
                     409,
                 )
-            return jsonify(run_set_readonly(exp, side, data["enabled"]))
+            return jsonify(run_set_readonly_locked(exp, side, data["enabled"]))
     finally:
         exp.finish_call()
 
