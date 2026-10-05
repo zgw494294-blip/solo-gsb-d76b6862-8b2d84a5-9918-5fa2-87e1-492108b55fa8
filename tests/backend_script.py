@@ -13,6 +13,18 @@ admit_experiment 准入门控、script_lock / conn_lock 与真实 SQLite，不�
 - 完成 / 取消后恢复手工操作，系统不自动提交 / 回滚；
 - BEGIN 先执行则装载 409，装载先成功则手工请求 409；
   并发交错下恰好一方成功；只读切换绝不在脚本有效期执行。
+
+第三部分用 run_op 包装器（RunOpGate）把指定栏的指定操作按在「在途」
+状态，由测试手动放行，确定性地控制实际路由的执行顺序，覆盖两栏独立
+进展与装载交错（修复前两栏手工请求被整段持有的 script_lock 串行化，
+甲的在途请求不结束，乙的 BEGIN / 只读切换就被卡住）：
+
+- 无有效脚本时，甲的读值在途，乙的 BEGIN / 只读切换不等甲结束即完成；
+  两栏互换同样适用；同栏请求仍串行；
+- 装载等待在途手工请求收尾：在途 BEGIN 先成功则装载 409，
+  绝不出现「装载成功后手工 BEGIN 才开启事务」；
+- 装载等待期间另一栏手工请求照常推进（其 BEGIN 先成功则装载 409）；
+  在途读值不留事务时，装载等其收尾后正常成功，此后手工请求 409。
 """
 import sys, types, json, os, re, tempfile, threading
 
@@ -560,6 +572,254 @@ for _ in range(20):
     if not ro_race_ok:
         break
 check("路由·并发只读/装载：切换绝不在脚本有效期执行(20轮)", ro_race_ok)
+
+# ================= 两栏手工请求互不等待 + 与装载交错 =================
+# RunOpGate 把指定栏的指定操作按在「在途」状态（已准入、尚未执行），
+# 由测试手动放行，从而确定性地控制实际路由的执行顺序。修复前手工路由在
+# 「复查 + 执行」整段持有实验级 script_lock：甲的在途请求不结束，乙的
+# BEGIN / 只读切换就被卡住（本节的及时性断言在修复前会失败）。
+real_run_op = A.run_op
+
+
+class RunOpGate:
+    """按 (exp_id, side, op) 拦截 run_op：在本栏连接临界区内暂停，由测试放行。
+
+    暂停期间与真实执行一样占用本栏 conn_lock——这正是「请求在途」的含义：
+    同栏请求会被如实串行，另一栏与装载的后续行为则由被测代码决定。
+    """
+
+    def __init__(self, exp_id, side, op):
+        self.exp_id = exp_id
+        self.side = side
+        self.op = op
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def __call__(self, exp, side, op, value):
+        if exp.id == self.exp_id and side == self.side and op == self.op:
+            with exp.conn_locks[side]:
+                self.entered.set()
+                # 限时等待：即使测试断言失败也不会永久卡住测试进程
+                self.release.wait(ROUTE_TIMEOUT)
+        return real_run_op(exp, side, op, value)
+
+
+def gated(gate, body):
+    """安装 gate 执行测试体，最后恢复真实 run_op。"""
+    A.run_op = gate
+    try:
+        body()
+    finally:
+        A.run_op = real_run_op
+
+
+def bg_call(fn, *args, **kwargs):
+    """在守护线程中发起路由调用，立即返回 (thread, box) 由测试控制节奏。"""
+    box = {}
+
+    def runner():
+        try:
+            box["resp"] = fn(*args, **kwargs)
+        except Exception as exc:  # 视图抛错：记录而不卡住测试
+            box["exc"] = exc
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    return t, box
+
+
+def bg_done(t, box):
+    return not t.is_alive() and "resp" in box
+
+
+# ---- 甲读值在途：乙的 BEGIN / 只读切换不等甲结束即完成 ----
+exp6 = create_exp()
+gate = RunOpGate(exp6, "a", "read")
+
+
+def two_panel_a_busy():
+    t_rd, box_rd = bg_call(client.post, op_url(exp6, "a"), {"op": "read"})
+    try:
+        check("两栏·甲读值在途", gate.entered.wait(ROUTE_TIMEOUT))
+        resp, exc, stuck = r_post(op_url(exp6, "b"), {"op": "begin"})
+        check("两栏·甲读值在途：乙BEGIN及时200", not stuck and exc is None
+              and resp.status_code == 200 and resp.get_json()["ok"] is True)
+        resp, exc, stuck = r_post(ro_url(exp6, "b"), {"enabled": True})
+        body = resp.get_json()
+        check("两栏·甲读值在途：乙只读切换及时200", not stuck and exc is None
+              and resp.status_code == 200 and body["ok"] is True
+              and body["state"]["readonly"] is True)
+        check("两栏·乙完成时甲读值仍在途", t_rd.is_alive())
+    finally:
+        gate.release.set()
+        t_rd.join(ROUTE_TIMEOUT)
+    check("两栏·放行后甲读值完成200", bg_done(t_rd, box_rd)
+          and box_rd["resp"].status_code == 200
+          and box_rd["resp"].get_json()["ok"] is True)
+    r_post(op_url(exp6, "b"), {"op": "rollback"})
+    r_post(ro_url(exp6, "b"), {"enabled": False})
+    resp, exc, stuck = r_delete("/api/experiments/%s" % exp6)
+    check("两栏·实验删除及时完成（名额已归还）",
+          not stuck and resp.status_code == 200)
+
+
+gated(gate, two_panel_a_busy)
+
+# ---- 两栏互换：乙读值在途，甲的 BEGIN / 只读切换不等乙结束 ----
+exp7 = create_exp()
+gate = RunOpGate(exp7, "b", "read")
+
+
+def two_panel_b_busy():
+    t_rd, box_rd = bg_call(client.post, op_url(exp7, "b"), {"op": "read"})
+    try:
+        check("互换·乙读值在途", gate.entered.wait(ROUTE_TIMEOUT))
+        resp, exc, stuck = r_post(op_url(exp7, "a"), {"op": "begin"})
+        check("互换·乙读值在途：甲BEGIN及时200", not stuck and exc is None
+              and resp.status_code == 200 and resp.get_json()["ok"] is True)
+        resp, exc, stuck = r_post(ro_url(exp7, "a"), {"enabled": True})
+        check("互换·乙读值在途：甲只读切换及时200", not stuck and exc is None
+              and resp.status_code == 200 and resp.get_json()["ok"] is True)
+        check("互换·甲完成时乙读值仍在途", t_rd.is_alive())
+    finally:
+        gate.release.set()
+        t_rd.join(ROUTE_TIMEOUT)
+    check("互换·放行后乙读值完成200", bg_done(t_rd, box_rd)
+          and box_rd["resp"].status_code == 200
+          and box_rd["resp"].get_json()["ok"] is True)
+    r_post(op_url(exp7, "a"), {"op": "rollback"})
+    r_post(ro_url(exp7, "a"), {"enabled": False})
+    resp, exc, stuck = r_delete("/api/experiments/%s" % exp7)
+    check("互换·实验删除及时完成（名额已归还）",
+          not stuck and resp.status_code == 200)
+
+
+gated(gate, two_panel_b_busy)
+
+# ---- 同栏请求仍串行：甲读值在途时，甲的 BEGIN 等它收尾 ----
+exp8 = create_exp()
+gate = RunOpGate(exp8, "a", "read")
+
+
+def same_panel_serial():
+    t_rd, box_rd = bg_call(client.post, op_url(exp8, "a"), {"op": "read"})
+    try:
+        check("同栏·甲读值在途", gate.entered.wait(ROUTE_TIMEOUT))
+        t_bg, box_bg = bg_call(client.post, op_url(exp8, "a"), {"op": "begin"})
+        t_bg.join(0.5)
+        check("同栏·读值在途时本栏BEGIN等待（仍串行）", t_bg.is_alive())
+    finally:
+        gate.release.set()
+        t_rd.join(ROUTE_TIMEOUT)
+        t_bg.join(ROUTE_TIMEOUT)
+    check("同栏·两请求最终都完成", bg_done(t_rd, box_rd) and bg_done(t_bg, box_bg)
+          and box_rd["resp"].status_code == 200
+          and box_bg["resp"].status_code == 200
+          and box_bg["resp"].get_json()["ok"] is True)
+    r_post(op_url(exp8, "a"), {"op": "rollback"})
+    r_delete("/api/experiments/%s" % exp8)
+
+
+gated(gate, same_panel_serial)
+
+# ---- 装载等待在途手工 BEGIN：BEGIN 先成功则装载 409 ----
+# 关键不变量：绝不出现「装载成功后手工 BEGIN 才开启事务」。
+exp9 = create_exp()
+gate = RunOpGate(exp9, "a", "begin")
+
+
+def load_waits_manual_begin():
+    t_bg, box_bg = bg_call(client.post, op_url(exp9, "a"), {"op": "begin"})
+    t_ld, box_ld = None, None
+    try:
+        check("装载交错·手工BEGIN在途", gate.entered.wait(ROUTE_TIMEOUT))
+        t_ld, box_ld = bg_call(client.post, script_url(exp9),
+                               [{"side": "b", "op": "begin"}])
+        t_ld.join(0.5)
+        check("装载交错·装载等待在途手工（未抢先成功）", t_ld.is_alive())
+    finally:
+        gate.release.set()
+        t_bg.join(ROUTE_TIMEOUT)
+        if t_ld is not None:
+            t_ld.join(ROUTE_TIMEOUT)
+    check("装载交错·在途BEGIN完成200", bg_done(t_bg, box_bg)
+          and box_bg["resp"].status_code == 200
+          and box_bg["resp"].get_json()["ok"] is True)
+    check("装载交错·BEGIN先成功：装载409", bg_done(t_ld, box_ld)
+          and box_ld["resp"].status_code == 409)
+    resp, _, _ = r_get(script_url(exp9))
+    check("装载交错·装载被拒后无有效脚本", resp.get_json()["script"] is None)
+    r_post(op_url(exp9, "a"), {"op": "rollback"})
+    resp, exc, stuck = r_delete("/api/experiments/%s" % exp9)
+    check("装载交错·实验删除及时完成（名额已归还）",
+          not stuck and resp.status_code == 200)
+
+
+gated(gate, load_waits_manual_begin)
+
+# ---- 装载等待期间另一栏照常推进：乙 BEGIN 先成功则装载 409 ----
+exp10 = create_exp()
+gate = RunOpGate(exp10, "a", "read")
+
+
+def load_waits_other_panel_goes():
+    t_rd, box_rd = bg_call(client.post, op_url(exp10, "a"), {"op": "read"})
+    t_ld, box_ld = None, None
+    try:
+        check("装载等待·甲读值在途", gate.entered.wait(ROUTE_TIMEOUT))
+        t_ld, box_ld = bg_call(client.post, script_url(exp10),
+                               [{"side": "a", "op": "read"}])
+        t_ld.join(0.5)
+        check("装载等待·装载等待在途读值", t_ld.is_alive())
+        # 装载等待期间，乙的手工 BEGIN 既不被甲的在途读值、
+        # 也不被等待中的装载阻塞
+        resp, exc, stuck = r_post(op_url(exp10, "b"), {"op": "begin"})
+        check("装载等待·期间乙BEGIN及时200", not stuck and exc is None
+              and resp.status_code == 200 and resp.get_json()["ok"] is True)
+    finally:
+        gate.release.set()
+        t_rd.join(ROUTE_TIMEOUT)
+        if t_ld is not None:
+            t_ld.join(ROUTE_TIMEOUT)
+    check("装载等待·乙BEGIN先成功：装载409", bg_done(t_ld, box_ld)
+          and box_ld["resp"].status_code == 409)
+    r_post(op_url(exp10, "b"), {"op": "rollback"})
+    r_delete("/api/experiments/%s" % exp10)
+
+
+gated(gate, load_waits_other_panel_goes)
+
+# ---- 在途读值不留事务：装载等其收尾后成功，此后手工请求 409 ----
+exp11 = create_exp()
+gate = RunOpGate(exp11, "a", "read")
+
+
+def load_after_manual_read():
+    t_rd, box_rd = bg_call(client.post, op_url(exp11, "a"), {"op": "read"})
+    t_ld, box_ld = None, None
+    try:
+        check("装载收尾·甲读值在途", gate.entered.wait(ROUTE_TIMEOUT))
+        t_ld, box_ld = bg_call(client.post, script_url(exp11),
+                               [{"side": "a", "op": "read"}])
+        t_ld.join(0.5)
+        check("装载收尾·装载等待在途读值", t_ld.is_alive())
+    finally:
+        gate.release.set()
+        t_rd.join(ROUTE_TIMEOUT)
+        if t_ld is not None:
+            t_ld.join(ROUTE_TIMEOUT)
+    check("装载收尾·读值不留事务：装载200", bg_done(t_ld, box_ld)
+          and box_ld["resp"].status_code == 200)
+    sid_e11 = box_ld["resp"].get_json()["script"]["id"]
+    resp, exc, stuck = r_post(op_url(exp11, "b"), {"op": "begin"})
+    check("装载收尾·装载成功后手工BEGIN 409", not stuck and resp.status_code == 409)
+    r_post(script_url(exp11, "/cancel"), {"script_id": sid_e11, "step": 1})
+    resp, exc, stuck = r_delete("/api/experiments/%s" % exp11)
+    check("装载收尾·实验删除及时完成（名额已归还）",
+          not stuck and resp.status_code == 200)
+
+
+gated(gate, load_after_manual_read)
 
 # ---- 既有字段与响应约定保持不变 ----
 resp, _, _ = r_post(op_url("does-not-exist", "a"), {"op": "begin"})

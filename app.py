@@ -52,11 +52,16 @@ WAL 检查点（PASSIVE / TRUNCATE）不由甲、乙两栏的连接执行，而�
 （begin/read/add/commit/rollback），add 另含 value，沿用与手工加法
 完全相同的整数校验（parse_int、±2⁶² 上限、大整数十进制字符串）。
 整份校验、非法整份拒绝（400），任何已存在脚本都不受影响。仅当两栏
-均无事务且当前没有有效（active）脚本时才能装载——装载在 script_lock
-内同时持两栏 conn_lock 复查 in_transaction，与手工 BEGIN 严格互斥。
-脚本只保存在内存，生成独立脚本 ID；查询（GET …/script 及 /status 的
-script 字段）只读内存，返回脚本 ID、从 1 开始的当前步号、全部步骤与
-逐次执行记录，绝不在两栏连接上额外读值。
+均无事务且当前没有有效（active）脚本时才能装载——装载先在 script_lock
+内等待已准入的在途手工请求收尾（等待经 wait() 释放锁，在途请求与
+另一栏的新请求都不被阻塞），再同时持两栏 conn_lock 复查
+in_transaction，与手工 BEGIN 严格互斥：手工 BEGIN 先成功则装载 409，
+装载先成功则手工请求 409，不会出现「装载成功后手工 BEGIN 才开启
+事务」。手工操作 / 只读切换只在 script_lock 内做 active 复查与在途
+计数，随即释放锁在本栏原连接上独立执行：同栏请求仍由本栏 conn_lock
+串行，两栏互不等待。脚本只保存在内存，生成独立脚本 ID；查询（GET
+…/script 及 /status 的 script 字段）只读内存，返回脚本 ID、从 1
+开始的当前步号、全部步骤与逐次执行记录，绝不在两栏连接上额外读值。
 
 脚本有效（active）期间，后端拒绝两栏的全部手工事务操作与只读切换
 （409）；查询、已提交值、时间线、检查点与删除仍照常可用。推进
@@ -210,11 +215,21 @@ class Experiment:
         # script_lock 串行化「装载 / 推进 / 跳过 / 取消」与手工操作的
         # active 互斥复查；同实验的脚本动作先在该锁上核对脚本 ID 与步号，
         # 再真实执行，过期请求一律 409，不会触碰到新脚本。
-        # 手工操作 / 只读切换路由在「复查 + 执行」整段持有这把锁，
-        # 锁内读标志只能用 _script_active_locked()——threading.Lock
-        # 不可重入，锁内再次获取会让请求永久卡住，并占住准入名额，
-        # 使随后的脚本查询、推进与删除一并阻塞。
+        # 手工操作 / 只读切换路由只在该锁内做「复查 + 在途计数」，
+        # 计数后即释放锁再执行，两栏手工请求互不等待（同栏请求仍由本栏
+        # conn_lock 串行）。锁内读标志只能用 _script_active_locked()——
+        # threading.Lock 不可重入，锁内再次获取会让请求永久卡住，
+        # 并占住准入名额，使随后的脚本查询、推进与删除一并阻塞。
         self.script_lock = threading.Lock()
+        # 在途手工请求计数（按栏）：手工路由在 script_lock 内通过 active
+        # 复查后 +1，执行结束（含失败 / 异常）在同一把锁内 -1 并唤醒
+        # manual_cond。装载在复查两栏 in_transaction 之前，于 script_lock
+        # 内等待两栏计数归零：已通过复查的在途手工 BEGIN 必然先执行完，
+        # 装载不会抢在它前面成功，杜绝「装载成功后手工 BEGIN 才开启事务」。
+        # 等待经 wait() 释放 script_lock，在途请求照常执行并归还计数，
+        # 另一栏新的手工请求在此期间也不被阻塞。
+        self.manual_cond = threading.Condition(self.script_lock)
+        self.manual_active = {"a": 0, "b": 0}
         self.script = None  # None 或 {id, steps, cursor, records, status}
 
     def _init_db(self):
@@ -345,16 +360,26 @@ class Experiment:
     def load_script(self, raw):
         """装载新脚本。调用方已完成整份校验。
 
-        仅当两栏均无事务且没有 active 脚本时才允许；在 script_lock 内
-        同时持两栏 conn_lock 复查 in_transaction，与手工 BEGIN 严格互斥，
-        不会出现「检查时无事务、装载时已 BEGIN」的窗口。成功后旧脚本的
-        查看记录被新脚本替换，旧脚本的在途动作因 ID 不符一律 409。
+        仅当两栏均无事务且没有 active 脚本时才允许；在 script_lock 内先
+        等待已准入的在途手工请求收尾（manual_active 归零），再同时持两栏
+        conn_lock 复查 in_transaction，与手工 BEGIN 严格互斥：不会出现
+        「检查时无事务、装载时已 BEGIN」，也不会出现「装载成功后手工
+        BEGIN 才开启事务」。成功后旧脚本的查看记录被新脚本替换，旧脚本的
+        在途动作因 ID 不符一律 409。
         """
         with self.script_lock:
-            if self.script is not None and self.script["status"] == "active":
-                return None, {
-                    "error": "an active script already exists; cancel it first"
-                }
+            # 等待已通过 active 复查的在途手工请求执行完：它们可能即将
+            # BEGIN。wait() 释放 script_lock，在途请求照常推进并在结束时
+            # 归还计数、唤醒本等待；另一栏新的手工请求在此期间也不被阻塞。
+            # 唤醒后必须重查 active：等待期间另一装载请求可能已先激活脚本。
+            while True:
+                if self.script is not None and self.script["status"] == "active":
+                    return None, {
+                        "error": "an active script already exists; cancel it first"
+                    }
+                if not self.manual_active["a"] and not self.manual_active["b"]:
+                    break
+                self.manual_cond.wait()
             with self.conn_locks["a"], self.conn_locks["b"]:
                 if self.conns["a"].in_transaction or self.conns["b"].in_transaction:
                     return None, {
@@ -505,8 +530,8 @@ class Experiment:
 
     def _script_active_locked(self):
         # 调用方必须已持有 script_lock。手工操作 / 只读切换路由在
-        # 「复查 + 执行」整段持有同一把锁（见路由注释），这里绝不能再
-        # 获取：threading.Lock 不可重入，重复获取会让请求永久卡住，
+        # 「复查 + 在途计数」临界区持有同一把锁（见路由注释），这里绝不能
+        # 再获取：threading.Lock 不可重入，重复获取会让请求永久卡住，
         # 占住准入名额并阻塞随后的脚本查询、推进与删除。
         return self.script is not None and self.script["status"] == "active"
 
@@ -1079,12 +1104,14 @@ def experiment_op(exp_id, side):
         if op not in VALID_OPS:
             return jsonify({"error": "unknown op"}), 400
         # 脚本有效期间拒绝手工事务操作（查询 / 检查点 / 删除不受影响）。
-        # 注意必须在**整段执行**持有 script_lock：仅在 run_op 之前检查会留下
-        # TOCTOU 窗口——手工 BEGIN 实际执行前，另一线程可能已装载脚本成功
-        # （装载在同一把锁内复查两栏无事务），从而破坏「有事务不能装载」
-        # 不变量。锁序 script_lock → conn_lock（run_op 内部）与 load_script
-        # 完全一致，不构成死锁环。锁内读标志只能用 _script_active_locked()：
-        # script_lock 不可重入，重复获取会让请求永久卡住并占住准入名额。
+        # active 复查与在途计数在同一段 script_lock 临界区内完成，计数后
+        # 即释放锁再执行：两栏手工请求互不等待（同栏请求仍由本栏
+        # conn_lock 串行），甲的在途读值不再阻塞乙的 BEGIN / 只读切换。
+        # 与装载的互斥不变：装载会在同一把锁内等待在途计数归零后才复查
+        # 两栏 in_transaction，因此不会留下「复查通过后、执行前被装载
+        # 抢先」的 TOCTOU 窗口，也不会出现「装载成功后手工 BEGIN 才开启
+        # 事务」。锁内读标志只能用 _script_active_locked()：script_lock
+        # 不可重入，重复获取会让请求永久卡住并占住准入名额。
         value = None
         if op == "add":
             value = parse_int(data.get("value"))
@@ -1098,7 +1125,15 @@ def experiment_op(exp_id, side):
                     jsonify({"error": "manual operations are locked while a script is active"}),
                     409,
                 )
+            exp.manual_active[side] += 1
+        try:
             return jsonify(run_op(exp, side, op, value))
+        finally:
+            # 执行结束（含失败 / 异常）归还本栏在途计数并唤醒等待中的
+            # 装载；准入名额由外层 finally 的 finish_call 归还。
+            with exp.script_lock:
+                exp.manual_active[side] -= 1
+                exp.manual_cond.notify_all()
     finally:
         exp.finish_call()
 
@@ -1117,15 +1152,25 @@ def experiment_set_readonly(exp_id, side):
         if not isinstance(data, dict) or not isinstance(data.get("enabled"), bool):
             return jsonify({"error": "enabled must be a boolean"}), 400
         # 脚本有效期间只读切换同样锁定（脚本必须沿两栏既定连接语义执行）。
-        # 与手工操作一样在整段持 script_lock，避免「检查后、执行前恰好装载」；
-        # 锁内同样只能用不重复取锁的 _script_active_locked() 读标志。
+        # 与手工操作一样只在 script_lock 内做「复查 + 在途计数」，随即释放
+        # 锁在本栏原连接上执行：两栏互不等待；装载等待在途计数归零后才
+        # 复查两栏事务，避免「检查后、执行前恰好装载」。锁内同样只能用
+        # 不重复取锁的 _script_active_locked() 读标志。
         with exp.script_lock:
             if exp._script_active_locked():
                 return (
                     jsonify({"error": "readonly switch is locked while a script is active"}),
                     409,
                 )
+            exp.manual_active[side] += 1
+        try:
             return jsonify(run_set_readonly(exp, side, data["enabled"]))
+        finally:
+            # 执行结束（含失败 / 异常）归还本栏在途计数并唤醒等待中的
+            # 装载；准入名额由外层 finally 的 finish_call 归还。
+            with exp.script_lock:
+                exp.manual_active[side] -= 1
+                exp.manual_cond.notify_all()
     finally:
         exp.finish_call()
 

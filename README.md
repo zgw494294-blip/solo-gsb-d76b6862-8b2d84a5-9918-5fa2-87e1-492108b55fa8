@@ -118,10 +118,10 @@
 - 卡住的请求占住 `script_lock` 与准入名额，随后的脚本查询、推进与删除
   一并阻塞。
 
-修复后：路由在「复查 + 执行」整段持有 `script_lock`，锁内改用不再重复
-取锁的 `_script_active_locked()` 读标志；请求结束（含 `409`）在
-`finally` 中归还准入名额，脚本查询、推进与删除照常完成。两个接口的字段
-与响应约定不变。
+修复后：锁内改用不再重复取锁的 `_script_active_locked()` 读标志；请求
+结束（含 `409`）在 `finally` 中归还准入名额，脚本查询、推进与删除照常
+完成。两个接口的字段与响应约定不变。（该修复最初让路由在「复查 + 执行」
+整段持有 `script_lock`，两栏手工请求因此被串行化；其后的改进见下节。）
 
 ### 复现（修复前）
 
@@ -185,6 +185,103 @@ curl -s -X DELETE $BASE                                           # {"deleted":t
 互斥顺序同样可用 HTTP 复现：手工 `BEGIN` 成功后 `POST …/script` 返回
 `409`；先装载成功则手工 `BEGIN` / 只读切换返回 `409`。回归测试由实际
 路由驱动（含并发交错），见下文「自动化交错测试」。
+
+## 两栏手工请求的独立执行（串行化修复）
+
+上一修复让手工路由在「复查 + 执行」整段持有实验级 `script_lock`：不再
+卡死，但**两栏手工请求被串行化**——无有效脚本时，甲的读值（或任何手工
+请求）尚未完成，乙的 `BEGIN` / 只读切换也要等甲结束才被处理；两栏互换
+同理。页面上一栏的请求明明只该禁用本栏，另一栏的合法操作却被拖住。
+
+修复后：手工操作（`POST …/conn/<side>/op`）与只读切换
+（`POST …/conn/<side>/readonly`）只在 `script_lock` 内做「active 复查 +
+在途计数」，随即释放锁在**本栏原连接**上执行——**同栏请求仍由本栏
+`conn_lock` 串行，两栏互不等待**。与脚本装载的互斥保持不变：装载在同一把
+锁内**等待在途计数归零**后，才持两栏 `conn_lock` 复查 `in_transaction`
+——装载先成功则手工请求 `409` 且不执行，手工 `BEGIN` 先成功则装载
+`409`，不会出现「装载成功后手工 `BEGIN` 才开启事务」；等待经 `wait()`
+释放锁，在途请求与另一栏的新请求都不被阻塞。两个入口的请求字段与响应
+约定不变；完成 / 取消脚本仍不代替提交、回滚；失败与被拒请求照常归还
+准入名额，删除仍等待已准入请求收尾。
+
+### 复现（修复前）
+
+纯 HTTP 下每个请求都是毫秒级，串行化窗口即对方请求的在途时长，需把一侧
+请求按住才能稳定观察。确定性复现由后端测试驱动（`RunOpGate` 把甲的读值
+按在本栏连接临界区内，模拟「读值尚未完成」，再发乙的请求）：
+
+```bash
+python3 tests/backend_script.py
+# 修复前：两栏·甲读值在途：乙BEGIN及时200          FAIL（乙等甲放行）
+#         互换·乙读值在途：甲BEGIN及时200          FAIL
+#         装载等待·期间乙BEGIN及时200              FAIL
+# 修复后：全部通过
+```
+
+手工复现：在服务端对 `run_op` 下断点（或调试器暂停）按住甲栏请求，另一
+终端 `curl` 乙栏 `BEGIN`——修复前乙等到断点放行才返回，修复后乙立即
+返回。
+
+### 修复后 HTTP 示例
+
+```bash
+EXP=$(curl -s -X POST http://localhost:8000/api/experiments \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["id"])')
+BASE=http://localhost:8000/api/experiments/$EXP
+
+# 两栏独立：并发发出，各自立即返回，互不等待
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}' &
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}' &
+wait
+# 两个都立即 {"ok":true,...}
+
+# 甲持写锁期间，乙的读值 / 只读切换照常立即返回（不等甲）；
+# 只有乙的加法仍如实撞写锁 SQLITE_BUSY(5)——事务与锁约定不变
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":5}'
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"read"}'                # 立即 200
+curl -s -X POST $BASE/conn/b/readonly -H 'Content-Type: application/json' \
+  -d '{"enabled":true}'             # 立即 200
+curl -s -X POST $BASE/conn/b/readonly -H 'Content-Type: application/json' \
+  -d '{"enabled":false}'
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":7}'
+# {"ok":false,"error":{"name":"SQLITE_BUSY","code":5,...},...}
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}'              # 已提交值 105
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"add","value":7}'       # 乙原事务重试成功
+curl -s -X POST $BASE/conn/b/op -H 'Content-Type: application/json' \
+  -d '{"op":"commit"}'              # 已提交值 112
+
+# 与装载的互斥不变：手工 BEGIN 先成功则装载 409
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"begin"}'
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/script \
+  -H 'Content-Type: application/json' -d '[{"side":"b","op":"begin"}]'
+# 409
+curl -s -X POST $BASE/conn/a/op -H 'Content-Type: application/json' \
+  -d '{"op":"rollback"}'
+
+# 装载先成功则手工请求 409 且不执行；取消后恢复
+SID=$(curl -s -X POST $BASE/script -H 'Content-Type: application/json' \
+  -d '[{"side":"a","op":"begin"}]' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["script"]["id"])')
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/conn/b/op \
+  -H 'Content-Type: application/json' -d '{"op":"begin"}'          # 409
+curl -s -o /dev/null -w "%{http_code}\n" -X POST $BASE/conn/a/readonly \
+  -H 'Content-Type: application/json' -d '{"enabled":true}'        # 409
+curl -s -X POST $BASE/script/cancel -H 'Content-Type: application/json' \
+  -d "{\"script_id\":\"$SID\",\"step\":1}"                         # 200
+curl -s -X DELETE $BASE                                            # {"deleted":true,...}
+```
+
+> 同栏请求仍串行：一栏的请求未完成时，该栏的下一个请求照常排队（页面
+> 也会禁用本栏控件）；另一栏的请求不受任何影响。
+
 
 ## 数值约定
 
@@ -314,7 +411,11 @@ stub 的最小路由分发**直接驱动实际路由**（真实准入门控与�
 模拟准入逻辑）：无有效脚本时手工 BEGIN / 只读切换及时返回、脚本有效期间
 及时 409 且不执行、被拒请求归还名额后查询 / 推进 / 删除不阻塞、完成 /
 取消后恢复手工操作且不自动提交 / 回滚、手工 BEGIN 与装载的并发交错恰好
-一方成功、只读切换绝不在脚本有效期执行：
+一方成功、只读切换绝不在脚本有效期执行；再用 `RunOpGate` 把指定栏操作
+按在在途状态、手动放行，**确定性控制实际路由执行顺序**：甲读值在途时乙的
+BEGIN / 只读切换及时完成（两栏互换同理）、同栏请求仍串行、装载等待在途
+手工收尾（在途 BEGIN 先成功则装载 409）、装载等待期间另一栏照常推进、
+在途读值不留事务时装载等其收尾后成功：
 
 ```bash
 python3 tests/backend_script.py
